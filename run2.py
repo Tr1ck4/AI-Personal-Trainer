@@ -6,14 +6,24 @@ import warnings
 import math
 import os
 import mediapipe as mp
-import tensorflow as tf
-from collections import deque
 import time
+import torch
+import torch.nn as nn
+from ultralytics import YOLO
+import ultralytics.utils.loss as loss_mod
 from utils_overlay import draw_feedback_overlay
-
 
 warnings.filterwarnings('ignore')
 
+
+class DFLoss(nn.Module):
+    """Lớp DFLoss giả để tương thích ngược."""
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+    def forward(self, preds, targets, *args, **kwargs):
+        return torch.tensor(0.0, device=preds.device)
+loss_mod.DFLoss = DFLoss
+    
 # --- CÁC THÀNH PHẦN CHUNG VÀ HÀM HỖ TRỢ ---
 
 mp_drawing = mp.solutions.drawing_utils
@@ -43,10 +53,6 @@ def extract_keypoints_for_details(results, important_landmarks: list):
         keypoint = landmarks[mp_pose.PoseLandmark[lm].value]
         data.append([keypoint.x, keypoint.y, keypoint.z, keypoint.visibility])
     return np.array(data).flatten().tolist()
-
-def extract_keypoints_for_sequence(results):
-    pose = np.array([[res.x, res.y, res.z, res.visibility] for res in results.pose_landmarks.landmark]).flatten() if results.pose_landmarks else np.zeros(33*4)
-    return pose
 
 def calculate_vector_angle(vector1, vector2):
     """Tính góc giữa hai vector (tính bằng độ)."""
@@ -511,7 +517,10 @@ class ExerciseDetector:
 
 def main():
     VIDEO_PATH = '1607.mp4'  
-    ACTION_MODEL_PATH = 'model/best_model_2307.keras'
+    
+    YOLO_MODEL_PATH = 'model/best.pt'
+    CONFIDENCE_THRESHOLD = 0.25
+    
     DETAIL_MODEL_PATHS = {
         'bicep_model': "model/bicep_KNN_model.pkl", 'bicep_scaler': "model/bicep_input_scaler.pkl",
         'plank_model': "model/plank_LR_model.pkl", 'plank_scaler': "model/plank_input_scaler.pkl",
@@ -521,135 +530,135 @@ def main():
         'lunge_scaler': "model/lunge_input_scaler.pkl"
     }
     
+    # THIẾT LẬP YOLO (thêm sau các định nghĩa path)
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"Sử dụng thiết bị: {device}")
+    
+    yolo_model = YOLO(YOLO_MODEL_PATH)
+    yolo_model.model.fuse()
+    yolo_model.to(device)
+    
+    use_half = (device == 'cuda')
+    if use_half:
+        yolo_model.model.half()
+
+    yolo_colors = [
+        (255, 0, 0),    # Lớp 0 - Đỏ
+        (0, 255, 0),    # Lớp 1 - Xanh lá
+        (0, 0, 255),    # Lớp 2 - Xanh dương
+        (255, 255, 0),  # Lớp 3 - Vàng
+        (0, 255, 255),  # Lớp 4 - Cyan
+    ]
+    
+    #####
     VISIBILITY_THRESHOLD = 0.6
     FOOT_SHOULDER_RATIO_THRESHOLDS, KNEE_FOOT_RATIO_THRESHOLDS = [1.2, 2.8], {"up": [0.5, 1.0], "down": [0.7, 1.1]}
     
-    if not os.path.exists(ACTION_MODEL_PATH): print(f"Lỗi: Không tìm thấy file model '{ACTION_MODEL_PATH}'."); return
-    action_model = tf.keras.models.load_model(ACTION_MODEL_PATH)
-
-    actions, sequence = np.array(['curl', 'lunge', 'plank', 'situp', 'squat']), deque(maxlen=30)
-    prediction_threshold = 0.4
-    frame_counter, INFERENCE_INTERVAL = 0, 5
-    last_predicted_action, last_confidence = "DETECTING...", 0.0
+    if not os.path.exists(YOLO_MODEL_PATH):
+        print(f"Lỗi: Không tìm thấy file YOLO model '{YOLO_MODEL_PATH}'.")
+        return
+    
+    frame_counter = 0
+    current_detected_exercise = "Detecting..."
+    detection_confidence = 0.0
 
     detector = ExerciseDetector(DETAIL_MODEL_PATHS)
     cap = cv2.VideoCapture(VIDEO_PATH)
-    if not cap.isOpened(): print(f"Lỗi: Không thể mở video/webcam tại '{VIDEO_PATH}'"); return
+    if not cap.isOpened(): 
+        print(f"Lỗi: Không thể mở video/webcam tại '{VIDEO_PATH}'")
+        return
     prev_time = 0
 
     with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret: print("Hết video hoặc không thể đọc frame."); break
-            
-            # Lật frame nếu cần (ví dụ video situp_demo.mp4 quay đúng chiều)
-            frame = cv2.flip(frame, 0) 
-            
-            image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB); image.flags.writeable = False
-            results = pose.process(image); image.flags.writeable = True
-            image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-            
-            if results.pose_landmarks:
-                mp_drawing.draw_landmarks(image, results.pose_landmarks, mp_pose.POSE_CONNECTIONS,
-                    mp_drawing.DrawingSpec(color=(244, 117, 66), thickness=2, circle_radius=2),
-                    mp_drawing.DrawingSpec(color=(245, 66, 230), thickness=2, circle_radius=1))
-
-                keypoints = extract_keypoints_for_sequence(results); sequence.append(keypoints)
-                if len(sequence) == 30 and frame_counter % INFERENCE_INTERVAL == 0:
-                    res = action_model.predict(np.expand_dims(list(sequence), axis=0), verbose=0)[0]
-                    confidence = np.max(res)
-                    if confidence > prediction_threshold:
-                        action = actions[np.argmax(res)]
-                        if last_predicted_action != action: detector.set_exercise_type(action.replace('curl', 'Bicep Curl').title())
-                        last_predicted_action, last_confidence = action, confidence
-                    else: last_predicted_action, last_confidence = "DETECTING...", confidence
+        # SỬA VÒNG LẶP WHILE - THÊM YOLO DETECTION
+        with torch.no_grad():  # Thêm context manager cho YOLO
+            while cap.isOpened():
+                ret, frame = cap.read()
+                if not ret: 
+                    print("Hết video hoặc không thể đọc frame."); break
+                    
                 
-                analysis_result = detector.analyze_exercise(results, foot_shoulder_thresholds=FOOT_SHOULDER_RATIO_THRESHOLDS, knee_foot_thresholds=KNEE_FOOT_RATIO_THRESHOLDS, visibility_threshold=VISIBILITY_THRESHOLD)
-
-                # --- GIAO DIỆN HIỂN THỊ ---
-                cv2.rectangle(image, (0, 0), (700, 160), (245, 117, 16), -1) # Tăng chiều cao hộp thoại
-                cv2.putText(image, f"MODE: {detector.current_exercise}", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
-                cv2.putText(image, f"ACTION: {last_predicted_action.upper()} ({last_confidence:.2f})", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
-
-                if detector.current_exercise == "Bicep Curl" and analysis_result:
-                    left_analyzer = analysis_result['bicep_left_analyzer']
-                    right_analyzer = analysis_result['bicep_right_analyzer']
-                    cv2.putText(image, f"LEFT REPS: {left_analyzer.counter}", (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
-                    cv2.putText(image, f"RIGHT REPS: {right_analyzer.counter}", (280, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
-                    cv2.putText(image, f"LEFT STAGE: {left_analyzer.stage}", (280, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
-                    cv2.putText(image, f"RIGHT STAGE: {right_analyzer.stage}", (480, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
-                    feedback_left = left_analyzer.feedback
-                    color_left = (0, 0, 255) if feedback_left != "GOOD" else (0, 255, 0)
-                    cv2.putText(image, f"L-STATUS: {feedback_left}", (10, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color_left, 2, cv2.LINE_AA)
-                    feedback_right = right_analyzer.feedback
-                    color_right = (0, 0, 255) if feedback_right != "GOOD" else (0, 255, 0)
-                    cv2.putText(image, f"R-STATUS: {feedback_right}", (280, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color_right, 2, cv2.LINE_AA)
-
-                elif detector.current_exercise == "Plank" and analysis_result:
-                    status = analysis_result['status']
-                    confidence = analysis_result['confidence']
-                    color = (0, 255, 0) if status == "Correct" else (0, 0, 255)
-                    cv2.putText(image, f"STATUS: {status} ({confidence:.2f})", (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
-
-                elif detector.current_exercise == "Squat" and analysis_result:
-                    cv2.putText(image, f"COUNT: {analysis_result['counter']}", (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
-                    cv2.putText(image, f"STAGE: {analysis_result['stage']}", (150, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
-                    foot_status = analysis_result['foot_placement']
-                    foot_color = (0, 255, 0) if foot_status == "Correct" else (0, 0, 255)
-                    cv2.putText(image, f"FOOT: {foot_status}", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, foot_color, 2, cv2.LINE_AA)
-                    knee_status = analysis_result['knee_placement']
-                    knee_color = (0, 255, 0) if knee_status == "Correct" else (0, 0, 255)
-                    cv2.putText(image, f"KNEE: {knee_status}", (200, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, knee_color, 2, cv2.LINE_AA)
                 
-                elif detector.current_exercise == "Lunge" and analysis_result:
-                    cv2.putText(image, f"COUNT: {analysis_result['counter']}", (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
-                    cv2.putText(image, f"STAGE: {analysis_result['stage']} ({analysis_result['stage_confidence']:.2f})", (200, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
-                    angle_status = "GOOD" if not analysis_result['knee_angle_error'] else "KNEE ANGLE ERROR"
-                    angle_color = (0, 255, 0) if not analysis_result['knee_angle_error'] else (0, 0, 255)
-                    cv2.putText(image, f"KNEE: {angle_status}", (10, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.6, angle_color, 2, cv2.LINE_AA)
-                    kot_status = "GOOD" if not analysis_result['knee_over_toe_error'] else "KNEE OVER TOE"
-                    kot_color = (0, 255, 0) if not analysis_result['knee_over_toe_error'] else (0, 0, 255)
-                    cv2.putText(image, f"POS: {kot_status}", (200, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.6, kot_color, 2, cv2.LINE_AA)
-                    back_status = "GOOD" if not analysis_result['back_posture_error'] else "BACK ERROR"
-                    back_color = (0, 255, 0) if not analysis_result['back_posture_error'] else (0, 0, 255)
-                    cv2.putText(image, f"BACK: {back_status}", (350, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.6, back_color, 2, cv2.LINE_AA)
-
-                elif detector.current_exercise == "Situp" and analysis_result:
-                    cv2.putText(image, f"COUNT: {analysis_result['counter']}", (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
-                    cv2.putText(image, f"STAGE: {analysis_result['stage'].upper()}", (220, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
-                    cv2.putText(image, f"ANGLE: {analysis_result['body_angle']}", (420, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+                # THÊM YOLO DETECTION TRƯỚC POSE DETECTION
+                yolo_results = yolo_model.predict(
+                    source=frame,
+                    device=device,
+                    half=use_half,
+                    conf=CONFIDENCE_THRESHOLD,
+                    verbose=False
+                )[0]
+                
+                if yolo_results.boxes:
+                    # Lấy detection có confidence cao nhất
+                    best_detection = None
+                    best_conf = 0
                     
-                    back_status = "GOOD" if not analysis_result['back_angle_error'] else "TOO LOW"
-                    back_color = (0, 255, 0) if not analysis_result['back_angle_error'] else (0, 0, 255)
-                    cv2.putText(image, f"BACK: {back_status}", (10, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.6, back_color, 2, cv2.LINE_AA)
+                    for box in yolo_results.boxes:
+                        conf = float(box.conf[0])
+                        if conf > best_conf:
+                            best_conf = conf
+                            cls_id = int(box.cls[0])
+                            class_name = yolo_model.names[cls_id]
+                            best_detection = class_name
+                            print("YOLO model classes:", yolo_model.names)
+                            
                     
-                    leg_status = "STABLE" if not analysis_result['leg_stability_error'] else "UNSTABLE"
-                    leg_color = (0, 255, 0) if not analysis_result['leg_stability_error'] else (0, 0, 255)
-                    cv2.putText(image, f"LEGS: {leg_status}", (150, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.6, leg_color, 2, cv2.LINE_AA)
-                    
-                    feedback_msg = detector.situp_analysis.get_feedback_message()
-                    feedback_color = (0, 255, 0) if feedback_msg == "Good form" else (0, 255, 255)
-                    cv2.putText(image, f"FEEDBACK: {feedback_msg}", (10, 145), cv2.FONT_HERSHEY_SIMPLEX, 0.6, feedback_color, 2, cv2.LINE_AA)
-
-            curr_time = time.time()
-            if prev_time > 0: fps = 1 / (curr_time - prev_time); cv2.putText(image, f"FPS: {int(fps)}", (image.shape[1] - 100, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            prev_time = curr_time
+                    if best_detection:
+                        # Map class names từ YOLO sang exercise names
+                        exercise_mapping = {
+                            'bicep': 'Bicep Curl',
+                            'lunge': 'Lunge', 
+                            'plank': 'Plank',
+                            'situp': 'Situp',
+                            'squat': 'Squat'
+                        }
+                        
+                        mapped_exercise = exercise_mapping.get(best_detection, best_detection.title())
+                        if current_detected_exercise != mapped_exercise:
+                            detector.set_exercise_type(mapped_exercise)
+                            current_detected_exercise = mapped_exercise
+                        detection_confidence = best_conf
+                        
+                image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                image.flags.writeable = False
+                results = pose.process(image)
+                image.flags.writeable = True
+                image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
             
-            image = cv2.resize(image, (1080, 720))
-            cv2.imshow('AI Exercise Coach', image)
-            frame_counter += 1
+                if results.pose_landmarks:
+                    mp_drawing.draw_landmarks(image, results.pose_landmarks, mp_pose.POSE_CONNECTIONS,
+                        mp_drawing.DrawingSpec(color=(244, 117, 66), thickness=2, circle_radius=2),
+                        mp_drawing.DrawingSpec(color=(245, 66, 230), thickness=2, circle_radius=1))
+                    
+                    action = current_detected_exercise
+                    confidence = detection_confidence
+                    result = detector.analyze_exercise(results, 
+                                                              foot_shoulder_thresholds=FOOT_SHOULDER_RATIO_THRESHOLDS, 
+                                                              knee_foot_thresholds=KNEE_FOOT_RATIO_THRESHOLDS, 
+                                                              visibility_threshold=VISIBILITY_THRESHOLD)
 
-            if cv2.waitKey(1) & 0xFF == ord('q'): break
+                    # --- GIAO DIỆN HIỂN THỊ ---
+                    frame = draw_feedback_overlay(frame, detector, result, action, confidence)
+                curr_time = time.time()
+                if prev_time > 0: fps = 1 / (curr_time - prev_time); cv2.putText(image, f"FPS: {int(fps)}", (image.shape[1] - 100, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                prev_time = curr_time
+                
+                # image = cv2.resize(image, (1080, 720))
+                cv2.imshow('AI Exercise Coach', image)
+                frame_counter += 1
+
+                if cv2.waitKey(1) & 0xFF == ord('q'): break
 
     cap.release()
     cv2.destroyAllWindows()
 
-
-def analyze_video_and_return_data(video_path, output_path="result/output.mp4"):
+def analyze_video_and_return_data_yolo(video_path, output_path="result/output_yolo.webm"):
     if not os.path.exists("result"):
-        os.makedirs("result")
-
-    ACTION_MODEL_PATH = 'model/best_model_2307.keras'
+        os.makedirs("result")  
+    
+    YOLO_MODEL_PATH = 'model/best.pt'
+    CONFIDENCE_THRESHOLD = 0.25
+    
     DETAIL_MODEL_PATHS = {
         'bicep_model': "model/bicep_KNN_model.pkl", 'bicep_scaler': "model/bicep_input_scaler.pkl",
         'plank_model': "model/plank_LR_model.pkl", 'plank_scaler': "model/plank_input_scaler.pkl",
@@ -658,33 +667,47 @@ def analyze_video_and_return_data(video_path, output_path="result/output.mp4"):
         'lunge_error_model': "model/lunge_err_LR_model.pkl",
         'lunge_scaler': "model/lunge_input_scaler.pkl"
     }
+    
+    # THIẾT LẬP YOLO (thêm sau các định nghĩa path)
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"Sử dụng thiết bị: {device}")
+    
+    yolo_model = YOLO(YOLO_MODEL_PATH)
+    yolo_model.model.fuse()
+    yolo_model.to(device)
+    
+    use_half = (device == 'cuda')
+    if use_half:
+        yolo_model.model.half()
 
+    yolo_colors = [
+        (255, 0, 0),    # Lớp 0 - Đỏ
+        (0, 255, 0),    # Lớp 1 - Xanh lá
+        (0, 0, 255),    # Lớp 2 - Xanh dương
+        (255, 255, 0),  # Lớp 3 - Vàng
+        (0, 255, 255),  # Lớp 4 - Cyan
+    ]
+    
+    #####
     VISIBILITY_THRESHOLD = 0.6
-    FOOT_SHOULDER_RATIO_THRESHOLDS = [1.2, 2.8]
-    KNEE_FOOT_RATIO_THRESHOLDS = {"up": [0.5, 1.0], "down": [0.7, 1.1]}
-
-    if not os.path.exists(ACTION_MODEL_PATH):
-        print(f"Lỗi: Không tìm thấy model {ACTION_MODEL_PATH}")
-        return None
-
-    action_model = tf.keras.models.load_model(ACTION_MODEL_PATH)
-    actions = np.array(['curl', 'lunge', 'plank', 'situp', 'squat'])
-    sequence = deque(maxlen=30)
-    prediction_threshold = 0.4
+    FOOT_SHOULDER_RATIO_THRESHOLDS, KNEE_FOOT_RATIO_THRESHOLDS = [1.2, 2.8], {"up": [0.5, 1.0], "down": [0.7, 1.1]}
+    
+    if not os.path.exists(YOLO_MODEL_PATH):
+        print(f"Lỗi: Không tìm thấy file YOLO model '{YOLO_MODEL_PATH}'.")
+        return
+    
     frame_counter = 0
-    INFERENCE_INTERVAL = 5
+    current_detected_exercise = "Detecting..."
+    detection_confidence = 0.0
     result = None
-    action = "DETECTING..."
     confidence = 0.0
-    last_predicted_action = "DETECTING..."
-    last_confidence = 0.0
+    action = "DETECTING..."
 
     detector = ExerciseDetector(DETAIL_MODEL_PATHS)
     cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        print(f"Lỗi: Không thể mở video tại {video_path}")
-        return None
-
+    if not cap.isOpened(): 
+        print(f"Lỗi: Không thể mở video/webcam tại '{video_path}'")
+        return
     # Ghi video dạng .webm cho Streamlit hiển thị
     output_path = output_path.replace(".mp4", ".webm")
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -694,60 +717,99 @@ def analyze_video_and_return_data(video_path, output_path="result/output.mp4"):
 
     mp_pose = mp.solutions.pose
     mp_drawing = mp.solutions.drawing_utils
+    prev_time = 0
 
     with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
+        # SỬA VÒNG LẶP WHILE - THÊM YOLO DETECTION
+        with torch.no_grad():  # Thêm context manager cho YOLO
+            while cap.isOpened():
+                ret, frame = cap.read()
+                if not ret: 
+                    print("Hết video hoặc không thể đọc frame."); break
+                    
+                
+                
+                # THÊM YOLO DETECTION TRƯỚC POSE DETECTION
+                yolo_results = yolo_model.predict(
+                    source=frame,
+                    device=device,
+                    half=use_half,
+                    conf=CONFIDENCE_THRESHOLD,
+                    verbose=False
+                )[0]
+                
+                if yolo_results.boxes:
+                    # Lấy detection có confidence cao nhất
+                    best_detection = None
+                    best_conf = 0
+                    
+                    for box in yolo_results.boxes:
+                        conf = float(box.conf[0])
+                        if conf > best_conf:
+                            best_conf = conf
+                            cls_id = int(box.cls[0])
+                            class_name = yolo_model.names[cls_id]
+                            best_detection = class_name
+                            print("YOLO model classes:", yolo_model.names)
+                            
+                    
+                    if best_detection:
+                        # Map class names từ YOLO sang exercise names
+                        exercise_mapping = {
+                            'bicep': 'Bicep Curl',
+                            'lunge': 'Lunge', 
+                            'plank': 'Plank',
+                            'situp': 'Situp',
+                            'squat': 'Squat'
+                        }
+                        
+                        mapped_exercise = exercise_mapping.get(best_detection, best_detection.title())
+                        if current_detected_exercise != mapped_exercise:
+                            detector.set_exercise_type(mapped_exercise)
+                            current_detected_exercise = mapped_exercise
+                        detection_confidence = best_conf
+                        
+                image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                image.flags.writeable = False
+                results = pose.process(image)
+                image.flags.writeable = True
+                image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+            
+                if results.pose_landmarks:
+                    mp_drawing.draw_landmarks(image, results.pose_landmarks, mp_pose.POSE_CONNECTIONS,
+                        mp_drawing.DrawingSpec(color=(244, 117, 66), thickness=2, circle_radius=2),
+                        mp_drawing.DrawingSpec(color=(245, 66, 230), thickness=2, circle_radius=1))
+                    
+                    action = current_detected_exercise
+                    confidence = detection_confidence
+                    result = detector.analyze_exercise(results, 
+                                                              foot_shoulder_thresholds=FOOT_SHOULDER_RATIO_THRESHOLDS, 
+                                                              knee_foot_thresholds=KNEE_FOOT_RATIO_THRESHOLDS, 
+                                                              visibility_threshold=VISIBILITY_THRESHOLD)
 
-            image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            image.flags.writeable = False
-            results = pose.process(image)
-            image.flags.writeable = True
-            image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+                    # --- GIAO DIỆN HIỂN THỊ ---
+                try:
+                    image = draw_feedback_overlay(image, detector, result, action, detection_confidence)
+                except KeyError:
+                    pass  
+                curr_time = time.time()
+                if prev_time > 0: fps = 1 / (curr_time - prev_time); cv2.putText(image, f"FPS: {int(fps)}", (image.shape[1] - 100, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                prev_time = curr_time
 
-            if results.pose_landmarks:
-                mp_drawing.draw_landmarks(image, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
-
-                keypoints = extract_keypoints_for_sequence(results)
-                sequence.append(keypoints)
-
-                if len(sequence) == 30 and frame_counter % INFERENCE_INTERVAL == 0:
-                    res = action_model.predict(np.expand_dims(list(sequence), axis=0), verbose=0)[0]
-                    confidence = np.max(res)
-                    if confidence > prediction_threshold:
-                        action = actions[np.argmax(res)]
-                        if last_predicted_action != action:
-                            detector.set_exercise_type(action.replace('curl', 'Bicep Curl').title())
-                        last_predicted_action = action
-                        last_confidence = confidence
-                    else:
-                        last_predicted_action = "DETECTING..."
-                        last_confidence = confidence
-
-                result = detector.analyze_exercise(
-                    results,
-                    foot_shoulder_thresholds=FOOT_SHOULDER_RATIO_THRESHOLDS,
-                    knee_foot_thresholds=KNEE_FOOT_RATIO_THRESHOLDS,
-                    visibility_threshold=VISIBILITY_THRESHOLD
-                )
-
-                # --- Overlay giao diện ---
-            image = draw_feedback_overlay(image, detector, result, action, confidence)
-            image = cv2.resize(image, (1080, 720))
-            out.write(image)
-            frame_counter += 1
+                image = cv2.resize(image, (1080, 720))
+                out.write(image)
+                frame_counter += 1
 
     cap.release()
     out.release()
     return output_path
-
-def analyze_webcam(video_path, output_path="result/output.mp4"):
+def analyze_webcam_yolo(video_path, output_path="result/output_yolo.webm"):
     if not os.path.exists("result"):
-        os.makedirs("result")
-
-    ACTION_MODEL_PATH = 'model/best_model_2307.keras'
+        os.makedirs("result")  
+    
+    YOLO_MODEL_PATH = 'model/best.pt'
+    CONFIDENCE_THRESHOLD = 0.25
+    
     DETAIL_MODEL_PATHS = {
         'bicep_model': "model/bicep_KNN_model.pkl", 'bicep_scaler': "model/bicep_input_scaler.pkl",
         'plank_model': "model/plank_LR_model.pkl", 'plank_scaler': "model/plank_input_scaler.pkl",
@@ -756,33 +818,44 @@ def analyze_webcam(video_path, output_path="result/output.mp4"):
         'lunge_error_model': "model/lunge_err_LR_model.pkl",
         'lunge_scaler': "model/lunge_input_scaler.pkl"
     }
+    
+    # THIẾT LẬP YOLO (thêm sau các định nghĩa path)
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"Sử dụng thiết bị: {device}")
+    
+    yolo_model = YOLO(YOLO_MODEL_PATH)
+    yolo_model.model.fuse()
+    yolo_model.to(device)
+    
+    use_half = (device == 'cuda')
+    if use_half:
+        yolo_model.model.half()
 
+    yolo_colors = [
+        (255, 0, 0),    # Lớp 0 - Đỏ
+        (0, 255, 0),    # Lớp 1 - Xanh lá
+        (0, 0, 255),    # Lớp 2 - Xanh dương
+        (255, 255, 0),  # Lớp 3 - Vàng
+        (0, 255, 255),  # Lớp 4 - Cyan
+    ]
+    
+    #####
     VISIBILITY_THRESHOLD = 0.6
-    FOOT_SHOULDER_RATIO_THRESHOLDS = [1.2, 2.8]
-    KNEE_FOOT_RATIO_THRESHOLDS = {"up": [0.5, 1.0], "down": [0.7, 1.1]}
-
-    if not os.path.exists(ACTION_MODEL_PATH):
-        print(f"Lỗi: Không tìm thấy model {ACTION_MODEL_PATH}")
-        return None
-
-    action_model = tf.keras.models.load_model(ACTION_MODEL_PATH)
-    actions = np.array(['curl', 'lunge', 'plank', 'situp', 'squat'])
-    sequence = deque(maxlen=30)
-    prediction_threshold = 0.4
+    FOOT_SHOULDER_RATIO_THRESHOLDS, KNEE_FOOT_RATIO_THRESHOLDS = [1.2, 2.8], {"up": [0.5, 1.0], "down": [0.7, 1.1]}
+    
+    if not os.path.exists(YOLO_MODEL_PATH):
+        print(f"Lỗi: Không tìm thấy file YOLO model '{YOLO_MODEL_PATH}'.")
+        return
+    
     frame_counter = 0
-    INFERENCE_INTERVAL = 5
-    result = None
-    action = "DETECTING..."
-    confidence = 0.0
-    last_predicted_action = "DETECTING..."
-    last_confidence = 0.0
+    current_detected_exercise = "Detecting..."
+    detection_confidence = 0.0
 
     detector = ExerciseDetector(DETAIL_MODEL_PATHS)
     cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        print(f"Lỗi: Không thể mở video tại {video_path}")
-        return None
-
+    if not cap.isOpened(): 
+        print(f"Lỗi: Không thể mở video/webcam tại '{video_path}'")
+        return
     # Ghi video dạng .webm cho Streamlit hiển thị
     output_path = output_path.replace(".mp4", ".webm")
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -792,54 +865,86 @@ def analyze_webcam(video_path, output_path="result/output.mp4"):
 
     mp_pose = mp.solutions.pose
     mp_drawing = mp.solutions.drawing_utils
+    prev_time = 0
 
     with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
+        # SỬA VÒNG LẶP WHILE - THÊM YOLO DETECTION
+        with torch.no_grad():  # Thêm context manager cho YOLO
+            while cap.isOpened():
+                ret, frame = cap.read()
+                if not ret: 
+                    print("Hết video hoặc không thể đọc frame."); break
+                    
+                
+                
+                # THÊM YOLO DETECTION TRƯỚC POSE DETECTION
+                yolo_results = yolo_model.predict(
+                    source=frame,
+                    device=device,
+                    half=use_half,
+                    conf=CONFIDENCE_THRESHOLD,
+                    verbose=False
+                )[0]
+                
+                if yolo_results.boxes:
+                    # Lấy detection có confidence cao nhất
+                    best_detection = None
+                    best_conf = 0
+                    
+                    for box in yolo_results.boxes:
+                        conf = float(box.conf[0])
+                        if conf > best_conf:
+                            best_conf = conf
+                            cls_id = int(box.cls[0])
+                            class_name = yolo_model.names[cls_id]
+                            best_detection = class_name
+                            print("YOLO model classes:", yolo_model.names)
+                            
+                    
+                    if best_detection:
+                        # Map class names từ YOLO sang exercise names
+                        exercise_mapping = {
+                            'bicep': 'Bicep Curl',
+                            'lunge': 'Lunge', 
+                            'plank': 'Plank',
+                            'situp': 'Situp',
+                            'squat': 'Squat'
+                        }
+                        
+                        mapped_exercise = exercise_mapping.get(best_detection, best_detection.title())
+                        if current_detected_exercise != mapped_exercise:
+                            detector.set_exercise_type(mapped_exercise)
+                            current_detected_exercise = mapped_exercise
+                        detection_confidence = best_conf
+                        
+                image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                image.flags.writeable = False
+                results = pose.process(image)
+                image.flags.writeable = True
+                image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+            
+                if results.pose_landmarks:
+                    mp_drawing.draw_landmarks(image, results.pose_landmarks, mp_pose.POSE_CONNECTIONS,
+                        mp_drawing.DrawingSpec(color=(244, 117, 66), thickness=2, circle_radius=2),
+                        mp_drawing.DrawingSpec(color=(245, 66, 230), thickness=2, circle_radius=1))
+                    
+                    action = current_detected_exercise
+                    confidence = detection_confidence
+                    result = detector.analyze_exercise(results, 
+                                                              foot_shoulder_thresholds=FOOT_SHOULDER_RATIO_THRESHOLDS, 
+                                                              knee_foot_thresholds=KNEE_FOOT_RATIO_THRESHOLDS, 
+                                                              visibility_threshold=VISIBILITY_THRESHOLD)
 
-            image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            image.flags.writeable = False
-            results = pose.process(image)
-            image.flags.writeable = True
-            image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+                    # --- GIAO DIỆN HIỂN THỊ ---
+                frame = draw_feedback_overlay(frame, detector, result, action, confidence)
+                curr_time = time.time()
+                if prev_time > 0: fps = 1 / (curr_time - prev_time); cv2.putText(image, f"FPS: {int(fps)}", (image.shape[1] - 100, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                prev_time = curr_time
 
-            if results.pose_landmarks:
-                mp_drawing.draw_landmarks(image, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
-
-                keypoints = extract_keypoints_for_sequence(results)
-                sequence.append(keypoints)
-
-                if len(sequence) == 30 and frame_counter % INFERENCE_INTERVAL == 0:
-                    res = action_model.predict(np.expand_dims(list(sequence), axis=0), verbose=0)[0]
-                    confidence = np.max(res)
-                    if confidence > prediction_threshold:
-                        action = actions[np.argmax(res)]
-                        if last_predicted_action != action:
-                            detector.set_exercise_type(action.replace('curl', 'Bicep Curl').title())
-                        last_predicted_action = action
-                        last_confidence = confidence
-                    else:
-                        last_predicted_action = "DETECTING..."
-                        last_confidence = confidence
-
-                result = detector.analyze_exercise(
-                    results,
-                    foot_shoulder_thresholds=FOOT_SHOULDER_RATIO_THRESHOLDS,
-                    knee_foot_thresholds=KNEE_FOOT_RATIO_THRESHOLDS,
-                    visibility_threshold=VISIBILITY_THRESHOLD
-                )
-
-                # --- Overlay giao diện ---
-            frame = draw_feedback_overlay(frame, detector, result, action, confidence)
-            image = cv2.resize(image, (1080, 720))
-            out.write(image)
-            frame_counter += 1
-
-    
-    return frame
-
+                image = cv2.resize(image, (1080, 720))
+                out.write(image)
+                frame_counter += 1
+        return frame
 
 
 

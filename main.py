@@ -2,20 +2,27 @@ import streamlit as st
 import tempfile
 import os
 import shutil
-from run import analyze_video_and_return_data, ExerciseDetector, extract_keypoints_for_sequence
+from run import analyze_video_and_return_data, ExerciseDetector, extract_keypoints_for_sequence, analyze_webcam
 
-from streamlit_webrtc import webrtc_streamer, VideoTransformerBase
+from streamlit_webrtc import webrtc_streamer, VideoTransformerBase,RTCConfiguration
 import tensorflow as tf
 import mediapipe as mp
 import numpy as np
 import cv2
 from collections import deque
+from ultralytics import YOLO
+import torch
+from utils_overlay import draw_feedback_overlay
+from run2 import analyze_video_and_return_data_yolo, analyze_webcam_yolo
+
+
 
 # --- CẤU HÌNH MODEL ---
 MODEL_MAP = {
     "Model A": "model/best_model_2307.keras",
-    "Model B": "model/best_model_fixed.keras"
+    "Model B": "YOLO"  # dùng chuỗi "YOLO" để biết là dùng mô hình best.pt
 }
+
 
 DETAIL_MODEL_PATHS = {
     'bicep_model': "model/bicep_KNN_model.pkl", 'bicep_scaler': "model/bicep_input_scaler.pkl",
@@ -29,15 +36,29 @@ DETAIL_MODEL_PATHS = {
 # --- VIDEO PROCESSOR CHO STREAMLIT-WEBRTC ---
 class VideoProcessor(VideoTransformerBase):
     def __init__(self, model_path):
-        self.model = tf.keras.models.load_model(model_path)
-        self.detector = ExerciseDetector(DETAIL_MODEL_PATHS)
         self.sequence = deque(maxlen=30)
-        self.actions = np.array(['curl', 'lunge', 'plank', 'situp', 'squat'])
-        self.threshold = 0.4
         self.frame_counter = 0
         self.last_action = "DETECTING..."
         self.last_confidence = 0.0
         self.pose = mp.solutions.pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5)
+        self.actions = np.array(['curl', 'lunge', 'plank', 'situp', 'squat'])
+
+        self.detector = ExerciseDetector(DETAIL_MODEL_PATHS)
+
+        if model_path == "YOLO":
+            # Dùng YOLO thay vì model keras
+            self.use_yolo = True
+            self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+            self.yolo_model = YOLO("model/best.pt")
+            self.yolo_model.to(self.device)
+            self.yolo_model.model.fuse()
+        else:
+            # Dùng model keras như cũ
+            import tensorflow as tf
+            self.use_yolo = False
+            self.model = tf.keras.models.load_model(model_path)
+
+        self.threshold = 0.4
 
     def transform(self, frame):
         image = frame.to_ndarray(format="bgr24")
@@ -52,18 +73,41 @@ class VideoProcessor(VideoTransformerBase):
             keypoints = extract_keypoints_for_sequence(results)
             self.sequence.append(keypoints)
 
-            if len(self.sequence) == 30 and self.frame_counter % 5 == 0:
-                res = self.model.predict(np.expand_dims(list(self.sequence), axis=0), verbose=0)[0]
-                confidence = np.max(res)
-                if confidence > self.threshold:
-                    action = self.actions[np.argmax(res)]
-                    if self.last_action != action:
-                        self.detector.set_exercise_type(action.replace("curl", "Bicep Curl").title())
-                    self.last_action = action
-                    self.last_confidence = confidence
-                else:
-                    self.last_action = "DETECTING..."
-                    self.last_confidence = confidence
+            if self.use_yolo:
+    # Nếu đang dùng YOLO (Model B)
+                if self.frame_counter % 5 == 0:
+                    yolo_result = self.yolo_model.predict(image, device=self.device, conf=0.25, verbose=False)[0]
+                    if yolo_result.boxes:
+                        best_box = max(yolo_result.boxes, key=lambda box: float(box.conf[0]))
+                        class_id = int(best_box.cls[0])
+                        class_name = self.yolo_model.names[class_id]
+
+                        exercise_map = {
+                            'bicep': 'Bicep Curl',
+                            'lunge': 'Lunge',
+                            'plank': 'Plank',
+                            'situp': 'Situp',
+                            'squat': 'Squat'
+                        }
+                        action = exercise_map.get(class_name, class_name.title())
+                        if self.last_action != action:
+                            self.detector.set_exercise_type(action)
+                        self.last_action = action
+                        self.last_confidence = float(best_box.conf[0])
+            else:
+                # Dùng model keras như cũ
+                if len(self.sequence) == 30 and self.frame_counter % 5 == 0:
+                    res = self.model.predict(np.expand_dims(list(self.sequence), axis=0), verbose=0)[0]
+                    confidence = np.max(res)
+                    if confidence > self.threshold:
+                        action = self.actions[np.argmax(res)]
+                        if self.last_action != action:
+                            self.detector.set_exercise_type(action.replace("curl", "Bicep Curl").title())
+                        self.last_action = action
+                        self.last_confidence = confidence
+                    else:
+                        self.last_action = "DETECTING..."
+                        self.last_confidence = confidence
 
             result = self.detector.analyze_exercise(
                 results,
@@ -72,84 +116,15 @@ class VideoProcessor(VideoTransformerBase):
                 visibility_threshold=0.6
             )
 
-            # GIAO DIỆN HIỂN THỊ (từ run.py)
-            # Vẽ nền overlay phía trên
-            # 🔁 Overlay TỐI ƯU: nhanh hơn, nhẹ hơn, không che người
+            
 
             # 🔁 Overlay tối ưu + dựng dọc góc trái + nhỏ gọn + feedback xuống dòng riêng
 
-            h, w = image.shape[:2]
+            image = draw_feedback_overlay(image, self.detector, result, self.last_action, self.last_confidence)
 
-            # Giảm chiều rộng khung overlay
-            box_width = 165  # <-- bạn có thể chỉnh dòng này để đổi chiều dài sau
-            box_height = 200
-            font_scale_title = 0.4
-            font_scale_body = 0.35
-            line_height = 18
-
-            # Nền dọc bên trái
-            cv2.rectangle(image, (0, 0), (box_width, box_height), (30, 30, 30), -1)
-
-            # Dòng tiêu đề
-            cv2.putText(image, f"MODE: {self.detector.current_exercise}", (10, 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, font_scale_title, (255, 255, 255), 1)
-            cv2.putText(image, f"ACTION: {self.last_action.upper()} ({self.last_confidence:.2f})", (10, 20 + line_height),
-                        cv2.FONT_HERSHEY_SIMPLEX, font_scale_body, (200, 200, 200), 1)
-
-            if self.detector.current_exercise == "Bicep Curl" and result:
-                l, r = result['bicep_left_analyzer'], result['bicep_right_analyzer']
-                cv2.putText(image, f"L: REP={l.counter} STG={l.stage}", (10, 20 + line_height*2),
-                            cv2.FONT_HERSHEY_SIMPLEX, font_scale_body, (255, 255, 255), 1)
-                cv2.putText(image, f"   {l.feedback}", (10, 20 + line_height*3),
-                            cv2.FONT_HERSHEY_SIMPLEX, font_scale_body, (0,255,0) if l.feedback=="GOOD" else (0,0,255), 1)
-
-                cv2.putText(image, f"R: REP={r.counter} STG={r.stage}", (10, 20 + line_height*4),
-                            cv2.FONT_HERSHEY_SIMPLEX, font_scale_body, (255, 255, 255), 1)
-                cv2.putText(image, f"   {r.feedback}", (10, 20 + line_height*5),
-                            cv2.FONT_HERSHEY_SIMPLEX, font_scale_body, (0,255,0) if r.feedback=="GOOD" else (0,0,255), 1)
-
-            elif self.detector.current_exercise == "Plank" and result:
-                status = result['status']
-                conf = result['confidence']
-                color = (0, 255, 0) if status == "Correct" else (0, 0, 255)
-                cv2.putText(image, f"STATUS: {status} ({conf:.2f})", (10, 20 + line_height*2),
-                            cv2.FONT_HERSHEY_SIMPLEX, font_scale_body, color, 1)
-
-            elif self.detector.current_exercise == "Squat" and result:
-                cv2.putText(image, f"REP={result['counter']} STG={result['stage']}", (10, 20 + line_height*2),
-                            cv2.FONT_HERSHEY_SIMPLEX, font_scale_body, (255,255,255), 1)
-                cv2.putText(image, f"FOOT={result['foot_placement']}", (10, 20 + line_height*3),
-                            cv2.FONT_HERSHEY_SIMPLEX, font_scale_body, (0,255,0) if result['foot_placement']=="Correct" else (0,0,255), 1)
-                cv2.putText(image, f"KNEE={result['knee_placement']}", (10, 20 + line_height*4),
-                            cv2.FONT_HERSHEY_SIMPLEX, font_scale_body, (0,255,0) if result['knee_placement']=="Correct" else (0,0,255), 1)
-
-            elif self.detector.current_exercise == "Lunge" and result:
-                cv2.putText(image, f"REP={result['counter']} STG={result['stage']}({result['stage_confidence']:.2f})", (10, 20 + line_height*2),
-                            cv2.FONT_HERSHEY_SIMPLEX, font_scale_body, (255,255,255), 1)
-                cv2.putText(image, f"KNEE: {'OK' if not result['knee_angle_error'] else 'BAD'}", (10, 20 + line_height*3),
-                            cv2.FONT_HERSHEY_SIMPLEX, font_scale_body, (0,255,0) if not result['knee_angle_error'] else (0,0,255), 1)
-                cv2.putText(image, f"TOE: {'OK' if not result['knee_over_toe_error'] else 'OVER'}", (10, 20 + line_height*4),
-                            cv2.FONT_HERSHEY_SIMPLEX, font_scale_body, (0,255,0) if not result['knee_over_toe_error'] else (0,0,255), 1)
-                cv2.putText(image, f"BACK: {'OK' if not result['back_posture_error'] else 'BAD'}", (10, 20 + line_height*5),
-                            cv2.FONT_HERSHEY_SIMPLEX, font_scale_body, (0,255,0) if not result['back_posture_error'] else (0,0,255), 1)
-
-            elif self.detector.current_exercise == "Situp" and result:
-                msg = self.detector.situp_analysis.get_feedback_message()
-                fb_color = (0, 255, 0) if msg == "Good form" else (0, 255, 255)
-                cv2.putText(image, f"REP={result['counter']} STG={result['stage'].upper()}", (10, 20 + line_height*2),
-                            cv2.FONT_HERSHEY_SIMPLEX, font_scale_body, (255,255,255), 1)
-                cv2.putText(image, f"BACK={'OK' if not result['back_angle_error'] else 'LOW'}", (10, 20 + line_height*3),
-                            cv2.FONT_HERSHEY_SIMPLEX, font_scale_body, (0,255,0) if not result['back_angle_error'] else (0,0,255), 1)
-                cv2.putText(image, f"LEG={'STABLE' if not result['leg_stability_error'] else 'UNSTABLE'}", (10, 20 + line_height*4),
-                            cv2.FONT_HERSHEY_SIMPLEX, font_scale_body, (0,255,0) if not result['leg_stability_error'] else (0,0,255), 1)
-                cv2.putText(image, f"FB: {msg}", (10, 20 + line_height*5),
-                            cv2.FONT_HERSHEY_SIMPLEX, font_scale_body, fb_color, 1)
-
-
-
-        self.frame_counter += 1
-        image = cv2.resize(image, (1080, 720))
-        return image
+            self.frame_counter += 1
+            image = cv2.resize(image, (1080, 720))
+            return image
 
 
 # --- STREAMLIT UI ---
@@ -187,7 +162,11 @@ if mode == "📤 Upload Video":
         output_path = os.path.join(output_dir, f"output_{timestamp}.webm")
 
         # 🔸 Phân tích và lưu video đầu ra
-        result_path = analyze_video_and_return_data(video_path, output_path=output_path)
+        if selected_model_name == "Model A":
+            result_path = analyze_video_and_return_data(video_path, output_path=output_path)
+        else:
+            result_path = analyze_video_and_return_data_yolo(video_path, output_path=output_path)
+
 
         if result_path and os.path.exists(result_path):
             st.success("✅ Phân tích xong! Xem video kết quả bên dưới.")
@@ -199,9 +178,15 @@ if mode == "📤 Upload Video":
 
 # --- XỬ LÝ WEBCAM REALTIME ---
 elif mode == "📹 Webcam Realtime":
+    rtc_config = RTCConfiguration({
+        "iceServers": [
+            {"urls": ["stun:stun.l.google.com:19302"]},  # Free public STUN server
+        ]
+    })
     st.warning("⚠️ Hãy cho phép trình duyệt sử dụng webcam.")
     webrtc_streamer(
         key=f"realtime-{selected_model_name.lower().replace(' ', '-')}",
+        rtc_configuration=rtc_config,
         video_processor_factory=lambda: VideoProcessor(selected_model_path),
         media_stream_constraints={"video": True, "audio": False},
         async_processing=True,
@@ -228,6 +213,5 @@ def show_results_section(model_label, folder):
 # ✅ Gọi cho từng model
 show_results_section("Model A", "result_model_a")
 show_results_section("Model B", "result_model_b")
-
 
 
